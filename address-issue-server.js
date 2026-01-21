@@ -18,11 +18,13 @@ const DB_PATH =
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 5 * 60 * 1000); // default 5 min
 
 // Which ShipStation tag to apply
-const ADDRESS_ISSUE_TAG_NAME = process.env.ADDRESS_ISSUE_TAG_NAME || "ADDRESS ISSUE";
+const ADDRESS_ISSUE_TAG_NAME =
+  process.env.ADDRESS_ISSUE_TAG_NAME || "ADDRESS ISSUE";
 
 // Which ShipStation order statuses to scan
-// ShipStation list orders supports statuses like awaiting_shipment, on_hold, etc.
-const ORDER_STATUSES = (process.env.ORDER_STATUSES || "awaiting_shipment,on_hold")
+const ORDER_STATUSES = (
+  process.env.ORDER_STATUSES || "awaiting_shipment,on_hold"
+)
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
@@ -32,6 +34,10 @@ const LOOKBACK_DAYS = Number(process.env.LOOKBACK_DAYS || 14);
 
 // Pagination
 const PAGE_SIZE = Number(process.env.PAGE_SIZE || 100);
+
+// Debug switch
+const DEBUG_ADDRESS_VERIFY =
+  (process.env.DEBUG_ADDRESS_VERIFY || "true") === "true";
 
 // ShipStation creds
 const SS_KEY = process.env.SHIPSTATION_API_KEY;
@@ -69,7 +75,7 @@ async function listOrders({ orderStatus, modifyDateStart, page }) {
     },
   });
 
-  // Response shape is typically { orders: [...], total, page, pages }
+  // Response shape typically: { orders: [...], total, page, pages }
   return res.data || {};
 }
 
@@ -169,14 +175,36 @@ function getRecentProcessed(limit = 100) {
 // BUSINESS LOGIC
 // ─────────────────────────────────────────────────────────────────────────────
 
-// According to ShipStation Address model, addressVerified may be:
-// "Address not yet validated", "Address validated successfully",
-// "Address validation warning", "Address validation failed"
+// ShipStation API commonly returns values like:
+// "Address not yet validated"
+// "Address validated successfully"
+// "Address validation warning"
+// "Address validation failed"
 const ADDRESS_FAILED_VALUE = "Address validation failed";
 
+function normalize(s) {
+  return String(s ?? "").trim();
+}
+
 function isAddressVerificationFailed(order) {
-  const av = order?.shipTo?.addressVerified;
-  return String(av || "").toLowerCase() === ADDRESS_FAILED_VALUE.toLowerCase();
+  const av = normalize(order?.shipTo?.addressVerified);
+  const avLower = av.toLowerCase();
+
+  // Debug: show what value ShipStation actually returns for addressVerified
+  if (DEBUG_ADDRESS_VERIFY) {
+    const orderNumber = order?.orderNumber || order?.orderKey || "";
+    const orderId = order?.orderId;
+
+    // Only log if addressVerified has a value
+    if (av) {
+      console.log(
+        `🔎 AddressVerified check: order=${orderNumber} id=${orderId} value="${av}"`
+      );
+    }
+  }
+
+  // Strict match (we'll adjust once we see your real value)
+  return avLower === ADDRESS_FAILED_VALUE.toLowerCase();
 }
 
 function formatIsoDateDaysAgo(days) {
@@ -192,6 +220,7 @@ async function scanAndTagAddressIssues(tagId) {
   console.log(`   Statuses: ${ORDER_STATUSES.join(", ")}`);
   console.log(`   modifyDateStart: ${modifyDateStart}`);
   console.log(`   Tag: ${ADDRESS_ISSUE_TAG_NAME} (tagId=${tagId})`);
+  console.log(`   Debug: ${DEBUG_ADDRESS_VERIFY}`);
   console.log(`${"═".repeat(80)}`);
 
   let foundFailed = 0;
@@ -201,7 +230,11 @@ async function scanAndTagAddressIssues(tagId) {
   for (const status of ORDER_STATUSES) {
     let page = 1;
     while (true) {
-      const data = await listOrders({ orderStatus: status, modifyDateStart, page });
+      const data = await listOrders({
+        orderStatus: status,
+        modifyDateStart,
+        page,
+      });
       const orders = data.orders || [];
 
       if (orders.length === 0) break;
@@ -212,6 +245,25 @@ async function scanAndTagAddressIssues(tagId) {
 
         if (!orderId) continue;
 
+        // Near-match debug: highlight any relevant values so we can see what's returned
+        const av = normalize(order?.shipTo?.addressVerified);
+        const avLower = av.toLowerCase();
+
+        const looksRelevant =
+          avLower.includes("fail") ||
+          avLower.includes("warn") ||
+          avLower.includes("not yet") ||
+          avLower.includes("valid");
+
+        if (DEBUG_ADDRESS_VERIFY && looksRelevant) {
+          console.log(
+            `🧪 POSSIBLE MATCH: order=${orderNumber} id=${orderId} addressVerified="${av}"`
+          );
+          // Uncomment briefly if you need more details (contains address info):
+          // console.log("   shipTo:", JSON.stringify(order.shipTo, null, 2));
+        }
+
+        // Only proceed to tagging if strict matcher says it's failed
         if (!isAddressVerificationFailed(order)) continue;
 
         foundFailed += 1;
@@ -224,9 +276,13 @@ async function scanAndTagAddressIssues(tagId) {
         }
 
         try {
-          console.log(`⚠️  Address validation failed: Order ${orderNumber} (ID ${orderId})`);
+          console.log(
+            `⚠️  Address validation failed: Order ${orderNumber} (ID ${orderId})`
+          );
+
           await addTagToOrder(orderId, tagId);
           await markProcessed(orderId, orderNumber, "tagged", "Tagged ADDRESS ISSUE");
+
           newlyTagged += 1;
           console.log(`✅ Tagged: ${orderNumber}`);
         } catch (e) {
@@ -263,6 +319,11 @@ app.get("/health", (req, res) => {
     status: "healthy",
     now: new Date().toISOString(),
     pollIntervalSeconds: Math.round(POLL_INTERVAL_MS / 1000),
+    lookbackDays: LOOKBACK_DAYS,
+    statuses: ORDER_STATUSES,
+    tagName: ADDRESS_ISSUE_TAG_NAME,
+    dbPath: DB_PATH,
+    debugAddressVerify: DEBUG_ADDRESS_VERIFY,
   });
 });
 
@@ -296,15 +357,21 @@ app.get("/", async (req, res) => {
 </head>
 <body>
   <h1>🏷️ Address Issue Auto-Tagger</h1>
-  <p class="muted">Auto-refreshes every 30s • Polls ShipStation every ${Math.round(POLL_INTERVAL_MS/1000)}s</p>
+  <p class="muted">Auto-refreshes every 30s • Polls ShipStation every ${Math.round(
+    POLL_INTERVAL_MS / 1000
+  )}s</p>
 
   <div class="cards">
-    ${stats.map(s => `
+    ${stats
+      .map(
+        (s) => `
       <div class="card">
         <div class="num">${s.count}</div>
         <div class="label">${String(s.status).toUpperCase()}</div>
       </div>
-    `).join("")}
+    `
+      )
+      .join("")}
   </div>
 
   <div class="card">
@@ -312,6 +379,7 @@ app.get("/", async (req, res) => {
     <div><strong>Statuses:</strong> ${ORDER_STATUSES.join(", ")}</div>
     <div><strong>Lookback:</strong> ${LOOKBACK_DAYS} days</div>
     <div><strong>DB:</strong> <code>${DB_PATH}</code></div>
+    <div><strong>Debug:</strong> ${DEBUG_ADDRESS_VERIFY}</div>
   </div>
 
   <h2>Recent Processed</h2>
@@ -326,7 +394,9 @@ app.get("/", async (req, res) => {
       </tr>
     </thead>
     <tbody>
-      ${recent.map(r => `
+      ${recent
+        .map(
+          (r) => `
         <tr>
           <td><strong>${r.order_number || ""}</strong></td>
           <td>${r.shipstation_order_id}</td>
@@ -334,7 +404,9 @@ app.get("/", async (req, res) => {
           <td class="muted">${(r.note || "").slice(0, 200)}</td>
           <td class="muted">${r.updated_at}</td>
         </tr>
-      `).join("")}
+      `
+        )
+        .join("")}
     </tbody>
   </table>
 </body>
@@ -369,7 +441,7 @@ async function start() {
   if (!tagId) {
     console.error(
       `❌ Tag "${ADDRESS_ISSUE_TAG_NAME}" not found in ShipStation.\n` +
-      `   Create it in ShipStation first, then restart this service.`
+        `   Create it in ShipStation first, then restart this service.`
     );
     process.exit(1);
   }
@@ -382,8 +454,11 @@ async function start() {
   });
 
   // Initial run + interval
-  console.log(`🤖 Worker polling every ${Math.round(POLL_INTERVAL_MS / 1000)} seconds...`);
+  console.log(
+    `🤖 Worker polling every ${Math.round(POLL_INTERVAL_MS / 1000)} seconds...`
+  );
   await scanAndTagAddressIssues(tagId);
+
   setInterval(() => {
     scanAndTagAddressIssues(tagId).catch((e) =>
       console.error("Worker fatal error:", e.message)
